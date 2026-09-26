@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IPv6 → IPv4 Geo Matcher</title>
+<style>
+*{box-sizing:border-box}
+body{
+  margin:0;background:#0d1526;color:#eef3ff;
+  font-family:system-ui,-apple-system,Segoe UI,sans-serif
+}
+.wrap{max-width:800px;margin:auto;padding:25px 16px}
+.card{
+  background:#172239;border:1px solid #30405d;
+  border-radius:18px;padding:20px
+}
+h1{margin:0 0 8px}
+.muted{color:#9ba9c0;line-height:1.5}
+.form{display:flex;gap:10px;margin-top:20px}
+input{
+  flex:1;min-width:0;padding:14px;border-radius:11px;
+  border:1px solid #3a4a68;background:#0e1729;color:#fff;
+  font-size:15px
+}
+button{
+  padding:14px 20px;border:0;border-radius:11px;
+  background:#2e6df6;color:white;font-weight:700
+}
+button:disabled{opacity:.5}
+.status{margin-top:16px;color:#aebbd0}
+.grid{
+  display:grid;grid-template-columns:repeat(2,1fr);
+  gap:10px;margin-top:15px
+}
+.box{
+  background:#101a2d;border:1px solid #293852;
+  border-radius:12px;padding:13px
+}
+.label{font-size:12px;color:#8796af}
+.value{font-size:17px;font-weight:700;margin-top:3px}
+.results{margin-top:18px}
+.ip{
+  display:flex;justify-content:space-between;gap:10px;
+  padding:13px;background:#101a2d;
+  border:1px solid #293852;border-radius:11px;
+  margin-top:8px
+}
+.ip b{font-family:monospace}
+.ip small{color:#9ba9c0;text-align:right}
+.err{color:#ff9898}
+@media(max-width:600px){
+ .form{flex-direction:column}
+ .grid{grid-template-columns:1fr}
+ .ip{display:block}
+ .ip small{display:block;text-align:left;margin-top:5px}
+}
+</style>
+</head>
+
+<body>
+<div class="wrap">
+<div class="card">
+
+<h1>IPv6 → IPv4 Geo Matcher</h1>
+
+<p class="muted">
+Masukkan IPv6 apa saja. City, State, Country dan ASN target
+akan ditentukan otomatis dari IPv6 tersebut.
+</p>
+
+<div class="form">
+<input id="ip" placeholder="Contoh: 2404:c0:9f01:e02f:96d6:57e0:3ed7:118d">
+<button id="btn">Lacak</button>
+</div>
+
+<div id="status" class="status"></div>
+<div id="target"></div>
+<div id="results"></div>
+
+</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function norm(v){
+  return String(v || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g,"")
+    .replace(/^(kabupaten|kota|regency|city)\s+/,"")
+    .trim();
+}
+
+function same(a,b){
+  return norm(a) === norm(b);
+}
+
+async function json(url){
+  const r = await fetch(url,{
+    headers:{Accept:"application/json"}
+  });
+
+  if(!r.ok) throw new Error("HTTP "+r.status);
+  return r.json();
+}
+
+/* IPv4/IPv6 GeoIP */
+async function geo(ip){
+
+  try{
+    const x = await json(
+      "https://ipapi.co/" +
+      encodeURIComponent(ip) +
+      "/json/"
+    );
+
+    if(x && !x.error){
+      return {
+        ip:x.ip || ip,
+        city:x.city || "",
+        state:x.region || "",
+        country:x.country_name || "",
+        cc:x.country_code || "",
+        asn:String(x.asn || "").toUpperCase(),
+        org:x.org || "",
+        postal:x.postal || "",
+        source:"ipapi.co"
+      };
+    }
+  }catch(e){}
+
+  /* fallback */
+  try{
+    const x = await json(
+      "https://ipwho.is/" +
+      encodeURIComponent(ip)
+    );
+
+    if(x && x.success !== false){
+      return {
+        ip:x.ip || ip,
+        city:x.city || "",
+        state:x.region || "",
+        country:x.country || "",
+        cc:x.country_code || "",
+        asn:x.connection?.asn
+          ? "AS"+String(x.connection.asn).replace(/^AS/i,"")
+          : "",
+        org:x.connection?.org || "",
+        postal:x.postal || "",
+        source:"ipwho.is"
+      };
+    }
+  }catch(e){}
+
+  return null;
+}
+
+/* RIPEstat: daftar prefix yang diumumkan ASN */
+async function getPrefixes(asn){
+
+  const resource = asn.replace(/^AS/i,"");
+
+  const url =
+    "https://stat.ripe.net/data/announced-prefixes/data.json" +
+    "?resource=AS" +
+    encodeURIComponent(resource);
+
+  const x = await json(url);
+
+  return (x.data?.prefixes || [])
+    .filter(p =>
+      /^\d+\.\d+\.\d+\.\d+\/\d+$/.test(p)
+    );
+}
+
+/* Ambil beberapa sample IPv4 dari setiap prefix */
+function samples(prefix){
+
+  const m =
+    prefix.match(
+      /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/
+    );
+
+  if(!m) return [];
+
+  const a = +m[1];
+  const b = +m[2];
+  const c = +m[3];
+  const d = +m[4];
+  const bits = +m[5];
+
+  if(bits < 8 || bits > 32) return [];
+
+  const base =
+    (((a<<24)>>>0) |
+     (b<<16) |
+     (c<<8) |
+     d) >>> 0;
+
+  const size = 2 ** (32-bits);
+
+  const nums = [
+    base,
+    base + 1,
+    base + Math.floor(size/4),
+    base + Math.floor(size/2),
+    base + size - 2
+  ];
+
+  return [...new Set(nums)]
+    .filter(n => n >= 0 && n <= 4294967295)
+    .map(n =>
+      [
+        (n>>>24)&255,
+        (n>>>16)&255,
+        (n>>>8)&255,
+        n&255
+      ].join(".")
+    );
+}
+
+async function run(){
+
+  const input = $("ip").value.trim();
+
+  if(!input){
+    $("status").innerHTML =
+      '<span class="err">Masukkan IPv6.</span>';
+    return;
+  }
+
+  $("btn").disabled = true;
+  $("target").innerHTML = "";
+  $("results").innerHTML = "";
+
+  try{
+
+    $("status").textContent =
+      "Mencari lokasi IPv6...";
+
+    const target = await geo(input);
+
+    if(!target)
+      throw new Error(
+        "GeoIP IPv6 tidak dapat diperoleh."
+      );
+
+    if(!target.asn)
+      throw new Error(
+        "ASN IPv6 tidak tersedia."
+      );
+
+    $("target").innerHTML = `
+      <div class="grid">
+        <div class="box">
+          <div class="label">CITY</div>
+          <div class="value">${target.city || "—"}</div>
+        </div>
+
+        <div class="box">
+          <div class="label">STATE / REGION</div>
+          <div class="value">${target.state || "—"}</div>
+        </div>
+
+        <div class="box">
+          <div class="label">COUNTRY</div>
+          <div class="value">${target.country || "—"}</div>
+        </div>
+
+        <div class="box">
+          <div class="label">ASN / ISP</div>
+          <div class="value">${target.asn}</div>
+          <div class="muted">${target.org || ""}</div>
+        </div>
+      </div>
+    `;
+
+    $("status").textContent =
+      "Mencari prefix IPv4 milik "+target.asn+"...";
+
+    const prefixes =
+      await getPrefixes(target.asn);
+
+    if(!prefixes.length)
+      throw new Error(
+        "Tidak menemukan prefix IPv4 untuk ASN tersebut."
+      );
+
+    /*
+      Buat daftar sample IPv4.
+      Tidak ada IPv4 yang diturunkan dari bit IPv6.
+    */
+    const candidates = [];
+
+    for(const prefix of prefixes){
+
+      for(const ip of samples(prefix)){
+
+        candidates.push({
+          ip,
+          prefix
+        });
+
+      }
+    }
+
+    $("status").textContent =
+      "Memeriksa "+candidates.length+
+      " alamat IPv4...";
+
+    const matches = [];
+    const seen = new Set();
+
+    /*
+      Maksimal 10 request paralel.
+    */
+    for(
+      let start=0;
+      start<candidates.length && matches.length<6;
+      start+=10
+    ){
+
+      const batch =
+        candidates.slice(start,start+10);
+
+      const checked =
+        await Promise.all(
+          batch.map(async candidate => {
+
+            const g =
+              await geo(candidate.ip);
+
+            if(!g) return null;
+
+            const asnOK =
+              !g.asn ||
+              g.asn === target.asn;
+
+            const cityOK =
+              target.city &&
+              g.city &&
+              same(target.city,g.city);
+
+            const stateOK =
+              target.state &&
+              g.state &&
+              same(target.state,g.state);
+
+            const countryOK =
+              target.cc
+                ? same(target.cc,g.cc)
+                : same(target.country,g.country);
+
+            if(
+              asnOK &&
+              cityOK &&
+              stateOK &&
+              countryOK
+            ){
+
+              return {
+                ...candidate,
+                geo:g
+              };
+
+            }
+
+            return null;
+
+          })
+        );
+
+      for(const x of checked){
+
+        if(
+          x &&
+          !seen.has(x.ip)
+        ){
+
+          seen.add(x.ip);
+          matches.push(x);
+
+        }
+
+        if(matches.length >= 6)
+          break;
+
+      }
+
+    }
+
+    if(!matches.length){
+
+      $("status").innerHTML =
+        '<span class="err">'+
+        'Tidak menemukan IPv4 yang cocok penuh dengan City + State + Country.'+
+        '</span>';
+
+      return;
+    }
+
+    $("status").textContent =
+      "Selesai — ditemukan "+
+      matches.length+
+      " IPv4 yang cocok.";
+
+    $("results").innerHTML = `
+      <h3>IPv4 yang cocok</h3>
+      <div class="results">
+        ${
+          matches.map(x => `
+            <div class="ip">
+              <div>
+                <b>${x.ip}</b>
+                <div class="muted">
+                  ${x.prefix}
+                </div>
+              </div>
+
+              <small>
+                ${x.geo.city}<br>
+                ${x.geo.state}<br>
+                ${x.geo.country}<br>
+                ${x.geo.asn}
+              </small>
+            </div>
+          `).join("")
+        }
+      </div>
+    `;
+
+  }catch(e){
+
+    $("status").innerHTML =
+      '<span class="err">'+
+      (e.message || "Terjadi kesalahan.")+
+      '</span>';
+
+  }finally{
+
+    $("btn").disabled = false;
+
+  }
+}
+
+$("btn").onclick = run;
+
+$("ip").addEventListener(
+  "keydown",
+  e => {
+    if(e.key === "Enter") run();
+  }
+);
+</script>
+
+</body>
+</html>
